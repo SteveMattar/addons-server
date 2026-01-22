@@ -1,0 +1,167 @@
+# Build and Push to ECR
+# This workflow builds the Docker image and pushes it to AWS ECR
+# Triggered on pushes to stage branch (tag-based releases can be enabled later)
+#
+# On pull_request: build-only (validates Dockerfile, no AWS auth required)
+# On push to stage: build + push to ECR (does require auth below)
+#
+# Authentication options:
+#
+# Option A - Static credentials (quick, but uses long-lived keys)
+#   GitHub Secrets:
+#     AWS_ACCESS_KEY_ID     - IAM user access key with ECR push permissions
+#     AWS_SECRET_ACCESS_KEY - IAM user secret key
+#
+# Option B - GitHub OIDC (recommended, and no need for long-lived keys)
+#   1. Create OIDC provider in AWS for token.actions.githubusercontent.com
+#   2. Create IAM role with trust policy restricted to:
+#      - repo:thunderbird/addons-server
+#      - ref:refs/heads/stage (or prod branch)
+#   3. Replace static credentials step with role to assume parameter
+#   See: https://tinyurl.com/ghAwsOidc
+#
+# Required IAM permissions (provided here by tb_pulumi.ci.AwsAutomationUser):
+#   - ecr:GetAuthorizationToken
+#   - ecr:BatchCheckLayerAvailability
+#   - ecr:BatchGetImage
+#   - ecr:CompleteLayerUpload
+#   - ecr:DescribeImages
+#   - ecr:InitiateLayerUpload
+#   - ecr:GetDownloadUrlForLayer
+#   - ecr:ListImages
+#   - ecr:UploadLayerPart
+#   - ecr:PutImage
+
+name: Build and Push to ECR
+
+on:
+  push:
+    branches:
+      - stage
+    # tags:
+    #   - 'v*'  # Uncomment when tag-based releases are defined
+  pull_request:
+    branches:
+      - stage
+      - master
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: atn-stage-addons-server
+  AWS_ACCOUNT_ID: "768512802988"
+
+jobs:
+  build:
+    name: Build and Push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # id-token: write  # Uncomment when switching to OIDC (Option B)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # AWS auth only needed for push (not PRs - they would just validate the build)
+      - name: Check publishing auth configured
+        if: github.event_name != 'pull_request'
+        run: |
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] || [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+            echo "::error::Missing AWS secrets for ECR publish. Either add static secrets or switch to OIDC role assumption."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        if: github.event_name != 'pull_request'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+            # type=semver,pattern={{version}}      # Enable when tag triggers are added
+            # type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push Docker image
+        id: build-image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.ecs
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            OLYMPIA_UID=9500
+            OLYMPIA_GID=9500
+
+      - name: Generate version.json
+        if: github.event_name != 'pull_request'
+        run: |
+          echo '{
+            "commit": "${{ github.sha }}",
+            "version": "${{ github.ref_name }}",
+            "source": "https://github.com/${{ github.repository }}",
+            "build": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }' > version.json
+          cat version.json
+
+      - name: Image digest
+        if: github.event_name != 'pull_request'
+        run: echo "Image pushed with digest ${{ steps.build-image.outputs.digest }}"
+
+  # Deploy to ECS (optional - we would uncomment this when ready)
+  # deploy:
+  #   name: Deploy to ECS
+  #   needs: build
+  #   runs-on: ubuntu-latest
+  #   if: github.ref == 'refs/heads/stage' && github.event_name != 'pull_request'
+  #
+  #   steps:
+  #     - name: Configure AWS credentials
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  #         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  #         aws-region: ${{ env.AWS_REGION }}
+  #
+  #     - name: Update ECS service (web)
+  #       run: |
+  #         aws ecs update-service \
+  #           --cluster thunderbird-addons-stage-web-cluster \
+  #           --service thunderbird-addons-stage-web-service \
+  #           --force-new-deployment
+  #
+  #     - name: Update ECS service (worker)
+  #       run: |
+  #         aws ecs update-service \
+  #           --cluster thunderbird-addons-stage-worker-cluster \
+  #           --service thunderbird-addons-stage-worker-service \
+  #           --force-new-deployment
+  #
+  #     - name: Update ECS service (versioncheck)
+  #       run: |
+  #         aws ecs update-service \
+  #           --cluster thunderbird-addons-stage-versioncheck-cluster \
+  #           --service thunderbird-addons-stage-versioncheck-service \
+  #           --force-new-deployment
