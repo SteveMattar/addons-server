@@ -3,24 +3,24 @@
 # Triggered on pushes to stage branch (tag-based releases can be enabled later)
 #
 # On pull_request: build-only (validates Dockerfile, no AWS auth required)
-# On push to stage: build + push to ECR (does require auth below)
+# On push to stage: build + push to ECR (requires OIDC role below)
 #
-# Authentication options:
-#
-# Option A - Static credentials (quick, but uses long-lived keys)
-#   GitHub Secrets:
-#     AWS_ACCESS_KEY_ID     - IAM user access key with ECR push permissions
-#     AWS_SECRET_ACCESS_KEY - IAM user secret key
-#
-# Option B - GitHub OIDC (recommended, and no need for long-lived keys)
-#   1. Create OIDC provider in AWS for token.actions.githubusercontent.com
-#   2. Create IAM role with trust policy restricted to:
-#      - repo:thunderbird/addons-server
-#      - ref:refs/heads/stage (or prod branch)
-#   3. Replace static credentials step with role to assume parameter
+# Authentication: GitHub OIDC
+#   Prerequisites:
+#     1. AWS OIDC provider for token.actions.githubusercontent.com (already exists)
+#     2. IAM role with trust policy condition:
+#        "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" }
+#        "StringLike": { "token.actions.githubusercontent.com:sub": "repo:thunderbird/addons-server:ref:refs/heads/stage" }
+#     3. Repository variable: AWS_ROLE_ARN (role ARN from step 2)
+#        Note: Can later be moved to an environment for stricter controls
 #   See: https://tinyurl.com/ghAwsOidc
 #
-# Required IAM permissions (provided here by tb_pulumi.ci.AwsAutomationUser):
+# Publishing is gated on BOTH:
+#   - Event type (push, not pull_request)
+#   - vars.AWS_ROLE_ARN is set
+# If either condition fails, then build succeeds but publish is skipped
+#
+# Required IAM permissions for the OIDC role:
 #   - ecr:GetAuthorizationToken
 #   - ecr:BatchCheckLayerAvailability
 #   - ecr:BatchGetImage
@@ -51,12 +51,13 @@ env:
   AWS_ACCOUNT_ID: "768512802988"
 
 jobs:
+  # Build job: always runs, validates Dockerfile, no AWS permissions needed
   build:
-    name: Build and Push
+    name: Build
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # id-token: write  # Uncomment when switching to OIDC (Option B)
+      # Note: no id-token here - minimum privilege for PR/build-only scenarios
 
     steps:
       - name: Checkout repository
@@ -64,28 +65,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      # AWS auth only needed for push (not PRs - they would just validate the build)
-      - name: Check publishing auth configured
-        if: github.event_name != 'pull_request'
-        run: |
-          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] || [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
-            echo "::error::Missing AWS secrets for ECR publish. Either add static secrets or switch to OIDC role assumption."
-            exit 1
-          fi
-
-      - name: Configure AWS credentials
-        if: github.event_name != 'pull_request'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        if: github.event_name != 'pull_request'
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Extract metadata for Docker
         id: meta
@@ -96,17 +75,15 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
             # type=semver,pattern={{version}}      # Enable when tag triggers are added
             # type=semver,pattern={{major}}.{{minor}}
 
-      - name: Build and push Docker image
-        id: build-image
+      - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile.ecs
-          push: ${{ github.event_name != 'pull_request' }}
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -115,8 +92,63 @@ jobs:
             OLYMPIA_UID=9500
             OLYMPIA_GID=9500
 
+  # Publish job: only runs on push to stage when OIDC role is configured
+  publish:
+    name: Publish to ECR
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stage' && vars.AWS_ROLE_ARN != ''
+    concurrency:
+      group: ecr-stage-publish
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC authn - only granted when actually publishing
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+            type=raw,value=stage-latest
+
+      - name: Build and push Docker image
+        id: build-image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.ecs
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            OLYMPIA_UID=9500
+            OLYMPIA_GID=9500
+
+      # Generate build metadata (future: bake into image or upload to S3 for traceability)
       - name: Generate version.json
-        if: github.event_name != 'pull_request'
         run: |
           echo '{
             "commit": "${{ github.sha }}",
@@ -127,41 +159,29 @@ jobs:
           cat version.json
 
       - name: Image digest
-        if: github.event_name != 'pull_request'
         run: echo "Image pushed with digest ${{ steps.build-image.outputs.digest }}"
 
-  # Deploy to ECS (optional - we would uncomment this when ready)
+  # Deploy to ECS (optional - we would uncomment this when ready, or move to separate deploy.yml)
   # deploy:
   #   name: Deploy to ECS
-  #   needs: build
+  #   needs: publish
   #   runs-on: ubuntu-latest
-  #   if: github.ref == 'refs/heads/stage' && github.event_name != 'pull_request'
+  #   permissions:
+  #     contents: read
+  #     id-token: write
   #
   #   steps:
-  #     - name: Configure AWS credentials
+  #     - name: Configure AWS credentials (OIDC)
   #       uses: aws-actions/configure-aws-credentials@v4
   #       with:
-  #         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  #         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  #         role-to-assume: ${{ vars.AWS_ROLE_ARN }}
   #         aws-region: ${{ env.AWS_REGION }}
   #
-  #     - name: Update ECS service (web)
+  #     - name: Update ECS services
   #       run: |
-  #         aws ecs update-service \
-  #           --cluster thunderbird-addons-stage-web-cluster \
-  #           --service thunderbird-addons-stage-web-service \
-  #           --force-new-deployment
-  #
-  #     - name: Update ECS service (worker)
-  #       run: |
-  #         aws ecs update-service \
-  #           --cluster thunderbird-addons-stage-worker-cluster \
-  #           --service thunderbird-addons-stage-worker-service \
-  #           --force-new-deployment
-  #
-  #     - name: Update ECS service (versioncheck)
-  #       run: |
-  #         aws ecs update-service \
-  #           --cluster thunderbird-addons-stage-versioncheck-cluster \
-  #           --service thunderbird-addons-stage-versioncheck-service \
-  #           --force-new-deployment
+  #         for service in web worker versioncheck; do
+  #           aws ecs update-service \
+  #             --cluster thunderbird-addons-stage-${service}-cluster \
+  #             --service thunderbird-addons-stage-${service}-service \
+  #             --force-new-deployment
+  #         done
