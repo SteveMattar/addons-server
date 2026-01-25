@@ -102,6 +102,124 @@ def main():
         pulumi.export(f"ecr_{repo_name}_url", ecr_repo.repository_url)
 
     # =========================================================================
+    # GitHub Actions OIDC Role for ECR publishing
+    # =========================================================================
+    # This role allows GH Actions to push images to ECR via OIDC
+    #
+    # Prerequisites
+    #   - OIDC provider exists: token.actions.githubusercontent.com
+    #   - After deployment we set AWS_ROLE_ARN as GitHub repo variable
+    #
+    # Trust policy restricts to
+    #   - this specific repository
+    #   - the stage branch only
+    #   - only the build-and-push.yml workflow
+    gha_oidc_config = resources.get("aws:iam:GitHubActionsOIDCRole", {})
+    addons_repo = ecr_repositories.get("addons-server")
+
+    if gha_oidc_config and not addons_repo:
+        pulumi.log.warn(
+            "OIDC role config present but aws:ecr:Repository.addons-server not defined "
+            "in this stack; so skipping OIDC role creation"
+        )
+
+    if gha_oidc_config and addons_repo:
+        github_org = gha_oidc_config.get("github_org", "thunderbird")
+        github_repo = gha_oidc_config.get("github_repo", "addons-server")
+        allowed_branches = gha_oidc_config.get("allowed_branches", ["stage"])
+        workflow_file = gha_oidc_config.get("workflow_file", ".github/workflows/build-and-push.yml")
+
+        # Build the subject conditions for allowed branches
+        sub_conditions = [
+            f"repo:{github_org}/{github_repo}:ref:refs/heads/{branch}"
+            for branch in allowed_branches
+        ]
+
+        # Build workflow ref conditions (job_workflow_ref hardening)
+        workflow_ref_conditions = [
+            f"{github_org}/{github_repo}/{workflow_file}@refs/heads/{branch}"
+            for branch in allowed_branches
+        ]
+
+        gha_trust_policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Federated": f"arn:aws:iam::{project.aws_account_id}:oidc-provider/token.actions.githubusercontent.com"
+                    },
+                    "Action": "sts:AssumeRoleWithWebIdentity",
+                    "Condition": {
+                        "StringEquals": {
+                            "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                            "token.actions.githubusercontent.com:iss": "https://token.actions.githubusercontent.com"
+                        },
+                        "StringLike": {
+                            "token.actions.githubusercontent.com:sub": sub_conditions if len(sub_conditions) > 1 else sub_conditions[0],
+                            "token.actions.githubusercontent.com:job_workflow_ref": workflow_ref_conditions if len(workflow_ref_conditions) > 1 else workflow_ref_conditions[0]
+                        }
+                    }
+                }
+            ]
+        })
+
+        gha_ecr_publish_role = aws.iam.Role(
+            f"{project.name_prefix}-gha-ecr-publish",
+            name=f"{project.name_prefix}-gha-ecr-publish",
+            description=f"GitHub Actions OIDC role for ECR publishing ({github_org}/{github_repo})",
+            assume_role_policy=gha_trust_policy,
+            tags=project.common_tags,
+        )
+
+        # ECR push permissions derive ARN from actual repo to avoid drifts
+        gha_ecr_policy_doc = addons_repo.arn.apply(lambda arn: json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ECRAuth",
+                    "Effect": "Allow",
+                    "Action": "ecr:GetAuthorizationToken",
+                    "Resource": "*"
+                },
+                {
+                    "Sid": "ECRPush",
+                    "Effect": "Allow",
+                    "Action": [
+                        "ecr:BatchCheckLayerAvailability",
+                        "ecr:BatchGetImage",
+                        "ecr:CompleteLayerUpload",
+                        "ecr:DescribeImages",
+                        "ecr:DescribeRepositories",
+                        "ecr:GetDownloadUrlForLayer",
+                        "ecr:InitiateLayerUpload",
+                        "ecr:ListImages",
+                        "ecr:PutImage",
+                        "ecr:UploadLayerPart"
+                    ],
+                    "Resource": arn
+                }
+            ]
+        }))
+
+        gha_ecr_policy = aws.iam.Policy(
+            f"{project.name_prefix}-gha-ecr-push-policy",
+            name=f"{project.name_prefix}-gha-ecr-push",
+            description="Allows GitHub Actions to push images to ECR",
+            policy=gha_ecr_policy_doc,
+            tags=project.common_tags,
+        )
+
+        aws.iam.RolePolicyAttachment(
+            f"{project.name_prefix}-gha-ecr-policy-attachment",
+            role=gha_ecr_publish_role.name,
+            policy_arn=gha_ecr_policy.arn,
+        )
+
+        # Export the role ARN for GitHub repo variable setup
+        pulumi.export("gha_ecr_publish_role_arn", gha_ecr_publish_role.arn)
+
+    # =========================================================================
     # Security Groups
     # =========================================================================
     sg_configs = resources.get("tb:network:SecurityGroupWithRules", {})
