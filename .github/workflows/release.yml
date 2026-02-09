@@ -1,0 +1,77 @@
+---
+name: deploy-production
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
+on:
+  release:
+    types:
+      - published
+
+env:
+  AWS_REGION: us-west-2
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-production:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      IS_CI_AUTOMATION: "yes"
+      # Determines whether resources should have protection against changes enabled based on the project's configuration.
+      # Unprotected resources are not part of a protected stack, or you have run Pulumi with
+      # `TBPULUMI_DISABLE_PROTECTION=True` set in your environment.
+      TBPULUMI_DISABLE_PROTECTION: False
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: "true"
+
+      - name: Download Pulumi artifact
+        uses: dsaltares/fetch-gh-release-asset@master
+        with:
+          version: ${{ github.event.release.tag_name }}
+          file: pulumi.tbz
+
+      - name: Decompress Pulumi code
+        shell: bash
+        run: |
+          tar -xvf pulumi.tbz
+
+      - name: Set up Python ${{ vars.PYTHON_VERSION}}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ vars.PYTHON_VERSION}}
+
+      - name: Install Pulumi
+        shell: bash
+        run: |
+          curl -fsSL https://get.pulumi.com | sh
+
+      - name: Deploy version-tagged image to prod
+        shell: bash
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        run: |
+          # Update the PATH to include the right version of Pulumi; this is non-trivial or impossible
+          # to do with the GHA workflow "env" settings.
+          export PATH="/home/runner/.pulumi/bin:$PATH"
+          export PULUMI_CONFIG_PASSPHRASE='${{ secrets.PULUMI_PASSPHRASE }}'
+
+          # Set up the Pulumi environment and update the service
+          pulumi login
+          pulumi stack select thunderbird/thunderbird-addons/prod
+          pulumi up -y --diff

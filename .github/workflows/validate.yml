@@ -1,0 +1,69 @@
+---
+name: validate
+
+concurrency:
+  group: validate
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - stage
+      - master
+  pull_request:
+    branches:
+      - stage
+      - master
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # This is required for requesting the JWT
+  contents: read    # This is required for actions/checkout
+
+jobs:
+  # This job detects which parts of the repo have been changed, setting future jobs up for conditional behavior.
+  detect-changes:
+    runs-on: ubuntu-latest
+    env:
+      IS_CI_AUTOMATION: "yes"
+    outputs:
+      src-changed: ${{ steps.check.outputs.src-changed }}
+      iac-changed: ${{ steps.check.outputs.iac-changed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: check
+        with:
+          filters: |
+            src-changed:
+              - 'Dockerfile'
+              - 'manage.py'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'src/**'
+            iac-changed:
+              - 'infra/**'
+
+  validate-iac:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.iac-changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: staging
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ruff formatting/linting checks
+        uses: chartboost/ruff-action@v1
+        with:
+          src: "infra/pulumi"
+          args: "format --check"
+
+      - name: Ruff error checks
+        uses: chartboost/ruff-action@v1
+        with:
+          src: "infra/pulumi"

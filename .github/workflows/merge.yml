@@ -1,0 +1,162 @@
+---
+name: deploy-stage
+
+concurrency:
+  group: deploy-stage
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - stage
+      - master
+    # tags:
+    #   - 'v*'  # Uncomment when tag-based releases are defined
+  pull_request:
+    branches:
+      - stage
+      - master
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-west-2
+
+permissions:
+  contents: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    env:
+      IS_CI_AUTOMATION: "yes"
+    outputs:
+      src-changed: ${{ steps.check.outputs.src-changed }}
+      iac-changed: ${{ steps.check.outputs.iac-changed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: check
+        with:
+          filters: |
+            src-changed:
+              - 'Dockerfile'
+              - 'manage.py'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'src/**'
+            iac-changed:
+              - 'infra/**'
+              - '.github/**'
+  # When changes are merged in, build and push a new Docker image
+  deploy:
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IS_CI_AUTOMATION: "yes"
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stage' && vars.AWS_ROLE_ARN
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC authn - only granted when actually publishing
+    steps:
+      # Preparation for future steps
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: "true"
+
+      - name: Set up Python ${{ vars.PYTHON_VERSION}}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ vars.PYTHON_VERSION}}
+
+      - name: Set up virtual environment
+        shell: bash
+        run: |
+          python -m pip install virtualenv
+          virtualenv ./venv
+
+      - name: Set up Pulumi environment
+        id: pulumi-env
+        shell: bash
+        run: |
+          source ./venv/bin/activate
+          curl -fsSL https://get.pulumi.com | sh
+          pip install -Ur requirements.txt
+
+      - name: Package Pulumi code
+        shell: bash
+        run: |
+          tar --exclude="venv" --exclude=".git" -cvjf pulumi.tbz ./
+
+      - name: Archive the Pulumi artifact
+        id: iac-archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulumi
+          path: pulumi.tbz
+
+      # Deploy to stage
+      - name: Deploy new image to stage
+        shell: bash
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        run: |
+          # Update the PATH to include the right version of Pulumi; this is non-trivial or impossible
+          # to do with the GHA workflow "env" settings above.
+          export PATH="/home/runner/.pulumi/bin:$PATH"
+          export PULUMI_CONFIG_PASSPHRASE='${{ secrets.PULUMI_PASSPHRASE }}'
+          
+          source ./venv/bin/activate
+          pulumi login
+          pulumi stack select thunderbird/thunderbird-addons/stage
+          pulumi up -y --diff
+
+  create-release:
+    needs: deploy
+    if: needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Pulumi package
+        uses: actions/download-artifact@v4
+        with:
+          name: pulumi  # Should pull "pulumi.tbz"
+
+      - name: Create release tag
+        id: create-release-tag
+        run: echo "tag_name=r-$(printf %04d $GITHUB_RUN_NUMBER)" >> $GITHUB_OUTPUT
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: |
+            ## Info
+            
+            Commit ${{ github.sha }} was deployed to `stage`. [See code diff](${{ github.event.compare }}).
+
+            It was initialized by [${{ github.event.sender.login }}](${{ github.event.sender.html_url }}).
+
+            ## How to Promote?
+
+            In order to promote this to prod, edit the draft and press **"Publish release"**.
+          draft: true
+          fail_on_unmatched_files: true
+          files: |
+            pulumi.tbz
+          name: Release ${{ steps.create-release-tag.outputs.tag_name }}
+          tag_name: ${{ steps.create-release-tag.outputs.tag_name }}

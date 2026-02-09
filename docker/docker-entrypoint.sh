@@ -117,6 +117,7 @@ start_versioncheck() {
         --enable-threads \
         --offload-threads=2 \
         --max-requests=${UWSGI_MAX_REQUESTS} \
+        --need-app \
         --die-on-term \
         --vacuum \
         --ignore-sigpipe \

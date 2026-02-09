@@ -55,6 +55,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       # Note: no id-token here - minimum privilege for PR/build-only scenarios
@@ -97,7 +98,7 @@ jobs:
     name: Publish (skipped - AWS_ROLE_ARN not set)
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/stage' && vars.AWS_ROLE_ARN == ''
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stage' && !vars.AWS_ROLE_ARN
     steps:
       - name: Publishing not configured
         run: |
@@ -109,7 +110,8 @@ jobs:
     name: Publish to ECR
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/stage' && vars.AWS_ROLE_ARN != ''
+    timeout-minutes: 45
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stage' && vars.AWS_ROLE_ARN
     concurrency:
       group: ecr-stage-publish
       cancel-in-progress: true
